@@ -1,6 +1,9 @@
 #lang racket/base
 (require racket/list
+         racket/system
          net/url
+         net/uri-codec
+         racket/match
          racket/function
          racket/path
          net/base64
@@ -16,8 +19,6 @@
                     user password)))))
 
 (define cache-path "/tmp/git-index.cache")
-(module+ main
-  (make-directory* cache-path))
 (define (github-api/pages id secret token path query)
   (let loop ([page 1])
     (define api-u
@@ -28,6 +29,7 @@
                          (cons 'client_secret secret)
                          (cons 'page (number->string page))))
            #f))
+    (make-directory* cache-path)
     (define api-u-cache-path
       (build-path
        cache-path
@@ -61,22 +63,34 @@
        (loop (add1 page))))))
 
 (module+ main
-  (require racket/runtime-path)
+  (require racket/cmdline
+           racket/runtime-path)
+  (define push? #f)
+  (command-line #:program "git-index"
+                #:once-each ["--push"
+                             "push every owned repo"
+                             (set! push? #t)])
+
   (define-runtime-path index-dir ".")
   (define me "jeapostrophe")
   (define my-home "/home/jay/Dev/scm/github.jeapostrophe/")
   (define my-dist "/home/jay/Dev/dist/")
   (define owned-ignore
     (list "home" "work" "jpn"))
+  (define observer-ignore
+    (list "sf"))
   (define observer-rewrite
+    ;; xxx this is derived for the fork's "parent"
     (hash "jeapostrophe/zguide" "imatix/zguide"
+          "jeapostrophe/sxml" "jbclements/sxml"
+          "jeapostrophe/glfw" "glfw/glfw"
+          "jeapostrophe/FrameworkBenchmarks" "TechEmpower/FrameworkBenchmarks"
+          "dyoo/whalesong" "samth/whalesong"
           "jeapostrophe/web-server-under-sandbox" "dyoo/web-server-under-sandbox"))
 
   (define id (file->string (build-path index-dir ".client_id")))
   (define secret (file->string (build-path index-dir ".client_secret")))
   (define token (file->string (build-path index-dir ".token")))
-
-  ;; xxx look at everything in ~exp to see if it is documented
 
   (define-syntax-rule
     (dir-cond [(p ...) ty] ...
@@ -104,11 +118,74 @@
          [("0_REWRITE" n) 'rewrite]
          [else
           (return (warning! "to clone own: ~a\n" n))]))
+
       (hash-set! OWNED n #t)
       (hash-set! MINE (format "~a/~a" me n) #t)
-      ;; xxx make sure ones i own have a README, LICENSE, and a
-      ;; reference to the index
-      (void)))
+
+      (when push?
+        (parameterize ([current-directory dir])
+          (system "git push")))
+
+      ;; xxx check homepage
+      (define r-path (build-path dir "README"))
+
+      (define (edit-readme)
+        (parameterize ([current-directory dir])
+          (system "touch README")
+          (system "emacsclient -c README")
+          (system "git add README")
+          (system "git commit -m 'Adding readme' README")))
+      (define (set-desc! d)
+        (system* "/usr/bin/curl"
+                 "-X" "PATCH"
+                 "-S" "-s"
+                 "-o" "/tmp/git-index.url"
+                 "-u" 
+                 (format "~a:~a" token "x-oauth-basic")
+                 "-d"
+                 (jsexpr->string (hash 'name n
+                                       'description d
+                                       'homepage ""))
+                 (format "https://api.github.com/repos/~a/~a" me n))
+        (when (directory-exists? cache-path)
+          (delete-directory/files cache-path)))
+
+      (cond
+        [(file-exists? r-path)
+         (define l (file->lines r-path))
+         (cond
+           [(empty? l)
+            (warning! "README is empty: ~a\n" n)
+            (edit-readme)]
+           [else
+            (unless (eq? type 'active)
+              (unless (regexp-match
+                       (format "^\\[~a\\]"
+                               (regexp-quote
+                                (symbol->string type)))
+                       (first l))
+                (warning! "README missing type: ~a\n" n)
+                (edit-readme)))
+            (match* ((first l) (hash-ref r 'description))
+              [(x x)
+               (void)]
+              [(x "")
+               (warning! "git description missing ~a\n" n)
+               (set-desc! x)]
+              [(x y)
+               (warning! "git description and README mismatch: ~a\n" n)
+               (set-desc! x)])])]
+        [else
+         (warning! "Adding README: ~a\n" n)
+         (edit-readme)])
+
+      (define l-path (build-path dir "LICENSE"))
+      (unless (file-exists? l-path)
+        (warning! "Adding LICENSE: ~a\n" n)
+        (copy-file (build-path index-dir "LICENSE") l-path)
+        (parameterize ([current-directory dir])
+          (system "git add LICENSE")
+          (system "git commit -m 'Adding license' LICENSE")))))
   (define (dir-check-owner!)
     (define (bp . n)
       (apply build-path my-home n))
@@ -122,31 +199,50 @@
         (define-values (_b np _m) (split-path d))
         (define n (path->string np))
         (unless (or (hash-has-key? OWNED n)
-                    (member n owned-ignore))
+                    (member n owned-ignore)
+                    (hash-has-key?
+                     OWNED
+                     ;; xxx check has_wiki
+                     (regexp-replace (regexp-quote ".wiki")
+                                     n
+                                     "")))
           (warning! "   to upload: ~a\n" n)))))
 
   (define OBSERVED (make-hash))
   (define (check-observer! r)
-    (define n (hash-ref r 'full_name))
+    (define raw-n (hash-ref r 'full_name))
+    (define n
+      (or (hash-ref observer-rewrite raw-n #f)
+          raw-n))
     (unless (hash-has-key? MINE n)
-      ;; xxx something should happen special for forks
-
       (define p (build-path my-dist n))
       (unless (directory-exists? p)
         (warning! "    to clone: ~a\n" n))
+
+      ;; git remote update
+      ;; git status | grep behind > /dev/null
+
       (hash-set! OBSERVED n #t)))
   (define (dir-check-observer!)
     (for ([up (in-list (directory-list my-dist))])
       (define fup (build-path my-dist up))
-      (when (directory-exists? fup)
-        (define u (path->string up))
-        (let/ec esc
-          (for ([rp (in-list (directory-list fup))])
-            (define frp (build-path fup rp))
-            (when (directory-exists? frp)
-              (define r (path->string rp))
-              (unless (hash-has-key? OBSERVED (format "~a/~a" u r))
-                (esc (warning! "     to star: ~a [~a]\n" u r)))))))))
+      (cond
+        [(directory-exists? fup)
+         (define u (path->string up))
+         (let/ec esc
+           (define has-dir? #f)
+           (for ([rp (in-list (directory-list fup))])
+             (define frp (build-path fup rp))
+             (when (directory-exists? frp)
+               (set! has-dir? #t)
+               (define r (path->string rp))
+               (unless (or (hash-has-key? OBSERVED (format "~a/~a" u r))
+                           (member u observer-ignore))
+                 (esc (warning! "     to star: ~a [~a]\n" u r)))))
+           (unless has-dir?
+             (warning! "     to star: ~a\n" u)))]
+        [else
+         (warning! "non-directory in dist: ~a\n" up)])))
 
   (define orgs
     (map (λ (r)
@@ -180,4 +276,45 @@
   (dir-check-observer!)
   (dir-check-owner!)
 
-  (void))
+  (let ()
+    (define exp (build-path my-home "exp"))
+    (define-syntax-rule (regexp-match-or p rx ...)
+      (or (regexp-match rx p) ...))
+    (define (git-ignored? p)
+      (regexp-match-or p
+                       "README"
+                       "LICENSE"
+                       "compiled"
+                       "dict.rktd"
+                       "workout-plan-inner.tex"
+                       "workout-plan.html"
+                       (regexp-quote ".git")
+                       "^#.*#$"
+                       "~$"
+                       "aux$"
+                       "log$"
+                       "bak$"
+                       "pdf$"))
+    (define files
+      (filter-not git-ignored?
+                  (sort (map path->string (directory-list exp)) string-ci<=?)))
+    (define (rest* l)
+      (if (empty? l) empty (rest l)))
+    (define idx (rest* (rest* (file->lines (build-path exp "README")))))
+    (let/ec esc
+      (let loop ([fs files] [is idx])
+        (match* (fs is)
+          [((list) (list))
+           (void)]
+          [((cons f fs) (list))
+           (warning! "~~exp - missing idx for ~a\n" f)
+           (loop fs empty)]
+          [((list) (cons i is))
+           (esc (warning! "~~exp - missing file for ~a\n" i))]
+          [((cons f fs) (cons i is))
+           (cond
+             [(regexp-match (format "^~a - " (regexp-quote f)) i)
+              (loop fs is)]
+             [else
+              (warning! "~~exp - missing idx for ~a\n" f)
+              (loop fs (cons i is))])])))))

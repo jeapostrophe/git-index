@@ -6,10 +6,16 @@
          racket/match
          racket/function
          racket/path
+         racket/pretty
          net/base64
          racket/port
          json
          racket/file)
+
+(define DEBUG? #f)
+(define (dprintf fmt . args)
+  (when DEBUG?
+    (apply printf fmt args)))
 
 (define (basic-auth-header user password)
   (format "Authorization: Basic ~a"
@@ -21,6 +27,7 @@
 (define cache-path "/tmp/git-index.cache")
 (define (github-api/pages id secret token path query)
   (let loop ([page 1])
+    (dprintf "loop ~v\n" (vector id secret token path query page))
     (define api-u
       (url "https" #f "api.github.com" #f #t
            (map (λ (x) (path/param x empty)) path)
@@ -39,7 +46,8 @@
                          "_"))))
     (define r
       (cond
-        [(and (file-exists? api-u-cache-path)
+        [(and #f ;; cache is turned off in production
+              (file-exists? api-u-cache-path)
               (> (file-or-directory-modify-seconds api-u-cache-path)
                  (- (current-seconds) (* 24 60 60))))
          (with-input-from-file api-u-cache-path read-json)]
@@ -54,22 +62,40 @@
          (with-output-to-file api-u-cache-path
            (λ () (display bs))
            #:exists 'replace)
-         (define r (read-json (open-input-bytes bs)))
+         (define r
+           (with-handlers ([exn:fail?
+                            (λ (x)
+                              (eprintf "Error with JSON from ~a:\n"
+                                       (url->string api-u))
+                              (eprintf "~a\n" s)
+                              (for ([h (in-list hs)])
+                                (eprintf "~a\n" h))
+                              (eprintf "\n~a\n"
+                                       bs)
+                              (raise x))])
+             (read-json (open-input-bytes bs))))
          r]))
-    (append
-     r
-     (if (empty? r)
-       empty
-       (loop (add1 page))))))
+    (if (list? r)
+      (append
+       r
+       (if (empty? r)
+         empty
+         (loop (add1 page))))
+      empty)))
 
 (module+ main
   (require racket/cmdline
            racket/runtime-path)
   (define push? #f)
+  (define cron? #f)
   (command-line #:program "git-index"
-                #:once-each ["--push"
-                             "push every owned repo"
-                             (set! push? #t)])
+                #:once-each
+                ["--push"
+                 "push every owned repo"
+                 (set! push? #t)]
+                ["--cron"
+                 "running from cron"
+                 (set! cron? #t)])
 
   (define-runtime-path index-dir ".")
   (define me "jeapostrophe")
@@ -78,11 +104,12 @@
   (define owned-ignore
     (list "home" "work" "jpn"))
   (define observer-ignore
-    (list "sf"))
+    (list "sf" "tom7" "suckless"))
   (define observer-rewrite
     ;; xxx this is derived for the fork's "parent"
     (hash "jeapostrophe/zguide" "imatix/zguide"
           "jeapostrophe/sxml" "jbclements/sxml"
+          "jeapostrophe/BigCrunch" "hloople/BigCrunch"
           "jeapostrophe/glfw" "glfw/glfw"
           "jeapostrophe/FrameworkBenchmarks" "TechEmpower/FrameworkBenchmarks"
           "dyoo/whalesong" "samth/whalesong"
@@ -102,7 +129,12 @@
       ...
       e))
 
-  (define warning! eprintf)
+  ;; If we would warn, delete the cache so that next time maybe the
+  ;; problem will go away
+  (define (warning! . a)
+    (when (directory-exists? cache-path)
+      (delete-directory/files cache-path))
+    (apply eprintf a))
 
   (define OWNED (make-hash))
   (define MINE (make-hash))
@@ -117,10 +149,13 @@
          [(  "0_MOVED" n) 'moved]
          [("0_REWRITE" n) 'rewrite]
          [else
-          (return (warning! "to clone own: ~a\n" n))]))
+          (let ()
+            (return (warning! "to clone own: ~a\n" n)))]))
 
       (hash-set! OWNED n #t)
       (hash-set! MINE (format "~a/~a" me n) #t)
+
+      ;; xxx maybe check if we should push
 
       (when push?
         (parameterize ([current-directory dir])
@@ -130,25 +165,24 @@
       (define r-path (build-path dir "README"))
 
       (define (edit-readme)
-        (parameterize ([current-directory dir])
-          (system "touch README")
-          (system "emacsclient -c README")
-          (system "git add README")
-          (system "git commit -m 'Adding readme' README")))
+        (unless cron?
+          (parameterize ([current-directory dir])
+            (system "touch README")
+            (system "emacsclient -c README")
+            (system "git add README")
+            (system "git commit -m 'Adding readme' README"))))
       (define (set-desc! d)
         (system* "/usr/bin/curl"
                  "-X" "PATCH"
                  "-S" "-s"
                  "-o" "/tmp/git-index.url"
-                 "-u" 
+                 "-u"
                  (format "~a:~a" token "x-oauth-basic")
                  "-d"
                  (jsexpr->string (hash 'name n
                                        'description d
                                        'homepage ""))
-                 (format "https://api.github.com/repos/~a/~a" me n))
-        (when (directory-exists? cache-path)
-          (delete-directory/files cache-path)))
+                 (format "https://api.github.com/repos/~a/~a" me n)))
 
       (cond
         [(file-exists? r-path)
@@ -219,6 +253,7 @@
       (unless (directory-exists? p)
         (warning! "    to clone: ~a\n" n))
 
+      ;; xxx maybe check to see if can be updated?
       ;; git remote update
       ;; git status | grep behind > /dev/null
 
@@ -241,6 +276,8 @@
                  (esc (warning! "     to star: ~a [~a]\n" u r)))))
            (unless has-dir?
              (warning! "     to star: ~a\n" u)))]
+        [(equal? up ".DS_Store")
+         (void)]
         [else
          (warning! "non-directory in dist: ~a\n" up)])))
 
@@ -260,7 +297,9 @@
                       (list (cons 'type "owner"))))
   (define-values (repos-forks repos-owned-mine)
     (partition (λ (r) (hash-ref r 'fork))
-               (append repos-owned repos-orgs)))
+               (filter (λ (r)
+                         (not (regexp-match #rx"^racket/" (hash-ref r 'full_name))))
+                       (append repos-owned repos-orgs))))
   (for-each check-owner! repos-owned-mine)
 
   (define repos-member
@@ -289,6 +328,7 @@
                        "workout-plan-inner.tex"
                        "workout-plan.html"
                        (regexp-quote ".git")
+                       (format "^~a.*" (regexp-quote ".#"))
                        "^#.*#$"
                        "~$"
                        "aux$"
